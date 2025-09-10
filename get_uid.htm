@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RFID UID 即時看板</title>
+  <style>
+    :root { --bg:#0b0c10; --card:#15171c; --ok:#18a999; --text:#e6e8ea; --muted:#9aa3ad; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", Arial, sans-serif; }
+    header { padding:20px; border-bottom:1px solid #22262c; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .dot { width:10px; height:10px; border-radius:50%; background:#666; display:inline-block; }
+    .dot.ok { background:var(--ok); }
+    .dot.bad { background:#d9534f; }
+    .pill { padding:4px 10px; border-radius:999px; background:#232833; color:var(--muted); font-size:12px; }
+    main { padding:20px; display:grid; grid-template-columns: repeat(auto-fill, minmax(320px,1fr)); gap:14px; }
+    .card { background:var(--card); border:1px solid #21242b; border-radius:14px; padding:14px; transition:transform .15s ease, border .2s ease, background .2s ease; }
+    .card.flash { transform:scale(1.015); border-color:var(--ok); background:#0f141b; }
+    .uid { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size:15px; letter-spacing:0.5px; word-break:break-all; }
+    .meta { color:var(--muted); font-size:12px; margin-top:6px; display:flex; justify-content:space-between; gap:8px; }
+    .kpi { display:flex; gap:14px; align-items:center; }
+    .kpi .num { font-weight:700; font-size:18px; }
+    .footer { color:var(--muted); font-size:12px; margin-left:auto; }
+    .hint { color:var(--muted); font-size:12px; margin-top:6px; }
+    .badge { padding:2px 8px; border-radius:8px; background:#1f2530; font-size:12px; color:#b9c2cc; }
+  </style>
+</head>
+<body>
+  <header>
+    <span id="statusDot" class="dot"></span>
+    <div class="kpi"><span class="badge">WS</span><span id="statusText">連線中…</span></div>
+    <div class="kpi"><span class="badge">在線 UID</span><span id="liveCount" class="num">0</span></div>
+    <div class="kpi"><span class="badge">本輪偵測</span><span id="roundNum" class="num">—</span></div>
+    <div class="kpi"><span class="badge">最後訊息</span><span id="lastTs" class="num">—</span></div>
+    <div class="footer">來源：<code>/ws</code></div>
+  </header>
+
+  <main id="grid"></main>
+
+  <section style="padding:0 20px 24px;">
+    <div class="hint">提示：未在 <strong>10 秒</strong> 內再次掃到的 UID 會自動從清單移除。</div>
+  </section>
+
+  <script>
+    const EXPIRE_MS = 10_000; // 超過這時間未更新就移除
+    const FLASH_MS  = 400;
+
+    const state = new Map(); // epc -> { lastSeen:number, el:HTMLElement }
+    let lastRound = null;
+    let lastTs = null;
+
+    const grid = document.getElementById('grid');
+    const liveCount = document.getElementById('liveCount');
+    const roundNum = document.getElementById('roundNum');
+    const lastTsEl = document.getElementById('lastTs');
+    const statusText = document.getElementById('statusText');
+    const statusDot = document.getElementById('statusDot');
+
+    function fmtTime(ts) {
+      if (!ts) return '—';
+      const d = new Date(ts);
+      const hh = String(d.getHours()).padStart(2,'0');
+      const mm = String(d.getMinutes()).padStart(2,'0');
+      const ss = String(d.getSeconds()).padStart(2,'0');
+      return `${hh}:${mm}:${ss}`;
+    }
+
+    function ensureCard(epc) {
+      let rec = state.get(epc);
+      if (rec && rec.el) return rec.el;
+
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <div class="uid">${epc}</div>
+        <div class="meta">
+          <span>最後看到：<span class="seen">—</span></span>
+          <span class="age">— s 前</span>
+        </div>
+      `;
+      grid.prepend(card);
+
+      if (!rec) rec = {};
+      rec.el = card;
+      state.set(epc, rec);
+      return card;
+    }
+
+    function flash(el) {
+      el.classList.add('flash');
+      setTimeout(() => el.classList.remove('flash'), FLASH_MS);
+    }
+
+    function setWsStatus(ok, txt) {
+      statusText.textContent = txt;
+      statusDot.className = 'dot ' + (ok ? 'ok' : 'bad');
+    }
+
+    const wsUrl = `${location.origin.replace(/^http/, 'ws')}/ws`;
+
+    let ws;
+    function connect() {
+      ws = new WebSocket(wsUrl);
+      ws.addEventListener('open', () => setWsStatus(true, '已連線'));
+      ws.addEventListener('close', () => {
+        setWsStatus(false, '連線中斷，3 秒後重試…');
+        setTimeout(connect, 3000);
+      });
+      ws.addEventListener('error', () => setWsStatus(false, 'WebSocket 錯誤'));
+      ws.addEventListener('message', onMessage);
+    }
+
+    function onMessage(ev) {
+      try {
+        const data = JSON.parse(ev.data);
+        if (Array.isArray(data.epcs)) {
+          const now = Date.now();
+          lastRound = data.round ?? lastRound;
+          lastTs = data.ts ?? now;
+          roundNum.textContent = (lastRound ?? '—');
+          lastTsEl.textContent = fmtTime(lastTs);
+
+          for (const epc of data.epcs) {
+            const el = ensureCard(epc);
+            state.set(epc, { lastSeen: now, el });
+            el.querySelector('.seen').textContent = fmtTime(now);
+            flash(el);
+          }
+          render();
+        }
+      } catch (e) {
+        console.warn('Bad message:', e);
+      }
+    }
+
+    function render() {
+      const now = Date.now();
+      let alive = 0;
+
+      for (const [epc, rec] of state) {
+        const ageMs = now - (rec.lastSeen || 0);
+        const ageSec = Math.floor(ageMs / 1000);
+
+        if (rec.el && rec.lastSeen) {
+          const ageEl = rec.el.querySelector('.age');
+          if (ageEl) ageEl.textContent = `${ageSec} s 前`;
+        }
+
+        if (rec.lastSeen && ageMs <= EXPIRE_MS) {
+          alive++;
+        } else {
+          if (rec.el && rec.el.parentNode) rec.el.parentNode.removeChild(rec.el);
+          state.delete(epc);
+        }
+      }
+
+      liveCount.textContent = alive;
+    }
+
+    setInterval(render, 1000);
+    connect();
+  </script>
+</body>
+</html>

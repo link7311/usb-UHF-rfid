@@ -1,57 +1,112 @@
-// Node.js 版：多標籤掃描（等同你給的 Python 邏輯）
-// 依賴：npm i serialport
-// 若要開 WebSocket + 靜態網頁：另外 npm i express ws
+// rfid_ws_server.js —— 支援黑名單、COM 自動/參數設定、熱切換 API、WS 心跳、穩定性強化
+// 依賴：npm i serialport express ws
 
 const { SerialPort } = require('serialport');
 const os = require('os');
 
-// ====== 參數區（照你的 Python 預設） ======
-const PORT = process.env.PORT || 'COM5';   // Linux 可用 /dev/ttyUSB0、/dev/ttyS0…
-const BAUD = parseInt(process.env.BAUD || '115200', 10);
-const WINDOW_MS = parseInt(process.env.WINDOW_MS || '400', 10); // 單輪收包時間窗
+// ====== 參數 ======
+function arg(name, def) {
+  const cli = process.argv.find(s => s.startsWith(`--${name}=`));
+  if (cli) return cli.split('=').slice(1).join('=');
+  const env = process.env[name.toUpperCase()];
+  return env ?? def;
+}
+let PORT_PATH = arg('port', 'auto');          // e.g. COM5, /dev/ttyUSB0, 或 auto
+const BAUD = parseInt(arg('baud', '115200'), 10);
+const WINDOW_MS = parseInt(arg('window_ms', '400'), 10);
+const ENABLE_WS = arg('enable_ws', '1') === '1';
+const WEB_PORT = parseInt(arg('web_port', '3000'), 10);
 
-// 指令：INVENTORY，一樣使用 16 進位 bytes
+// 指令：INVENTORY
 const CMD_INVENTORY = Buffer.from('BB00220000227E', 'hex');
 
-// ======（選用）開啟 WS + 靜態前端 ======
-// 設定 ENABLE_WS=1 時生效
-const ENABLE_WS = process.env.ENABLE_WS === '1';
+// ====== 黑名單 ======
+const BLACKLIST_DEFAULT = new Set(["E280F3372000F000135FFABE"]);
+function makeBlacklist() {
+  const s = new Set([...BLACKLIST_DEFAULT]);
+  const envList = (process.env.BLACKLIST || '')
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean);
+  for (const id of envList) s.add(id.toUpperCase());
+  return s;
+}
+let BLACKLIST = makeBlacklist();
+
+// ====== (可選) WS + 靜態網頁 ======
 let wss = null;
 let server = null;
+let app = null;
 if (ENABLE_WS) {
   const path = require('path');
   const http = require('http');
   const express = require('express');
   const WebSocket = require('ws');
 
-  const WEB_PORT = parseInt(process.env.WEB_PORT || '3000', 10);
-  const app = express();
+  app = express();
+  app.use(express.static(__dirname));                    // 直接伺服同層 (get_uid.htm)
 
-  // ⬇️ 改這裡：直接伺服「同層目錄」的檔案（例如 get_uid.htm）
-  app.use(express.static(__dirname));
+  // 列出可用序列埠
+  app.get('/ports', async (_req, res) => {
+    try {
+      const list = await SerialPort.list();
+      res.json(list.map(p => ({
+        path: p.path,
+        manufacturer: p.manufacturer || null,
+        vendorId: p.vendorId || null,
+        productId: p.productId || null,
+        friendlyName: p.friendlyName || p.serialNumber || null,
+      })));
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
 
-  // 若仍想保留 public/ 也可加：
-  // app.use(express.static(path.join(__dirname, 'public')));
+  // 熱切換序列埠：/set-port?path=COM7
+  app.get('/set-port', async (req, res) => {
+    const nextPath = req.query.path;
+    if (!nextPath) return res.status(400).json({ error: 'missing ?path=' });
+    try {
+      await switchPort(nextPath);
+      res.json({ ok: true, port: nextPath });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
 
   server = http.createServer(app);
   wss = new WebSocket.Server({ server, path: '/ws' });
 
+  // WS 心跳，清掉殭屍連線
+  function heartbeat() { this.isAlive = true; }
+  wss.on('connection', (ws) => {
+    ws.isAlive = true;
+    ws.on('pong', heartbeat);
+  });
+  const hb = setInterval(() => {
+    wss.clients.forEach(ws => {
+      if (ws.isAlive === false) return ws.terminate();
+      ws.isAlive = false; ws.ping();
+    });
+  }, 30000);
+  wss.on('close', () => clearInterval(hb));
+
   server.listen(WEB_PORT, () => {
     console.log(`[WS] HTTP on http://localhost:${WEB_PORT}`);
     console.log(`[WS] WebSocket on ws://localhost:${WEB_PORT}/ws`);
-    console.log(`[WS] 打開 http://localhost:${WEB_PORT}/get_uid.htm`);
+    console.log(`[WS] UI: http://localhost:${WEB_PORT}/get_uid.htm`);
+    console.log(`[API] List ports:   GET /ports`);
+    console.log(`[API] Switch port:  GET /set-port?path=COM7`);
   });
 }
 
 function wsBroadcast(obj) {
   if (!wss) return;
   const msg = JSON.stringify(obj);
-  wss.clients.forEach(c => {
-    if (c.readyState === 1) c.send(msg);
-  });
+  wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
 }
 
-// ====== 輔助：切 frame（以 0xBB 起始、0x7E 結尾） ======
+// ====== 工具：切 frame ======
 function cutFrames(rawBuf) {
   const frames = [];
   let buf = rawBuf;
@@ -67,47 +122,36 @@ function cutFrames(rawBuf) {
 }
 
 // ====== 解析單一 frame ======
-// 格式：BB | addr | cmd | lenH lenL | data... | chkH chkL | 7E
 function parseFrame(fr) {
   if (fr.length < 9 || fr[0] !== 0xBB || fr[fr.length - 1] !== 0x7E) return null;
-
   const len = (fr[3] << 8) + fr[4];
   const data = fr.slice(5, 5 + len);
   if (data.length < 5) return null;
 
   const pc = data.slice(0, 2);
   const rest = data.slice(2);
-
-  // 嘗試「有/無 1 byte 天線/RSSI 欄位」
   for (const skip of [1, 0]) {
     if (rest.length - skip >= 3) {
       const epc = rest.slice(skip, -2);
       const crc = rest.slice(-2);
       if (epc.length >= 4) {
-        return {
-          pc: pc.toString('hex'),
-          epc: epc.toString('hex').toUpperCase(),
-          crc: crc.toString('hex')
-        };
+        return { pc: pc.toString('hex'), epc: epc.toString('hex').toUpperCase(), crc: crc.toString('hex') };
       }
     }
   }
   return null;
 }
 
-// ====== 發一次指令並在時間窗內收集一輪 EPC（去重） ======
+// ====== 發一次指令並在時間窗內收集一輪 EPC ======
 async function inventoryRound(port, windowMs = 400) {
   let raw = Buffer.alloc(0);
-
   await portWrite(port, CMD_INVENTORY);
   const endAt = Date.now() + windowMs;
-
   return new Promise((resolve) => {
     const onData = (chunk) => {
       raw = Buffer.concat([raw, chunk]);
       if (Date.now() >= endAt) finish();
     };
-
     function finish() {
       port.off('data', onData);
       const epcs = new Set();
@@ -117,49 +161,104 @@ async function inventoryRound(port, windowMs = 400) {
       }
       resolve(epcs);
     }
-
     port.on('data', onData);
-
-    // 保險計時器
-    setTimeout(() => {
-      if (port.listenerCount('data') > 0) finish();
-    }, windowMs + 50);
+    setTimeout(() => { if (port.listenerCount('data') > 0) finish(); }, windowMs + 50);
   });
 }
 
-// ====== 封裝 serialport write 成 promise ======
+// ====== 封裝 write ======
 function portWrite(port, buf) {
   return new Promise((resolve, reject) => {
     port.write(buf, (err) => (err ? reject(err) : resolve()));
   });
 }
 
-// ====== 主流程 ======
-async function main() {
-  console.log(`開始多標籤測試（Ctrl+C 結束） on ${PORT}@${BAUD}`);
-  const port = new SerialPort({ path: PORT, baudRate: BAUD, autoOpen: false });
+// ====== 串口管理：自動挑選 / 開啟 / 熱切換 ======
+let port = null;             // SerialPort 物件
+let running = false;         // 掃描 loop 是否運行中
+let roundId = 1;
+let health = { ok: 0, empty: 0, blkOnly: 0 };
 
-  port.on('error', (e) => console.error('Serial error:', e.message));
+async function pickPort(autoHint = PORT_PATH) {
+  if (autoHint !== 'auto') return autoHint;
+  const list = await SerialPort.list();
+  if (!list || list.length === 0) throw new Error('找不到任何序列埠');
+  // 優先挑 COM*/ttyUSB*/ttyACM*
+  const preferred = list.find(p => /COM\d+|ttyUSB\d+|ttyACM\d+/.test(p.path)) || list[0];
+  console.log(`[Serial] auto 選擇: ${preferred.path} (${preferred.friendlyName || preferred.manufacturer || ''})`);
+  return preferred.path;
+}
 
-  // 打開
-  await new Promise((resolve, reject) => {
-    port.open((err) => (err ? reject(err) : resolve()));
+async function openPort(path) {
+  return new Promise((resolve, reject) => {
+    const p = new SerialPort({ path, baudRate: BAUD, autoOpen: false });
+    p.open(err => (err ? reject(err) : resolve(p)));
   });
+}
 
-  // 提高讀取即時性
-  port.set({ dtr: true, rts: true }, () => {});
+async function safeOpen(path) {
+  while (true) {
+    try {
+      const p = await openPort(path);
+      p.set({ dtr: true, rts: true }, () => {});
+      console.log(`[Serial] 已開啟 ${path}@${BAUD}`);
+      // 斷線自動重連（沿用同一路徑）
+      p.on('close', async () => {
+        console.warn('[Serial] 連線關閉，5 秒後嘗試重連…');
+        try { p.removeAllListeners('data'); } catch(_) {}
+        await new Promise(r => setTimeout(r, 5000));
+        if (PORT_PATH) {
+          try { port = await safeOpen(PORT_PATH); } catch(e) { console.error('[Serial] 重連失敗：', e.message); }
+        }
+      });
+      p.on('error', async (e) => {
+        console.error('[Serial] 錯誤：', e.message);
+        try { p.close(); } catch(_) {}
+      });
+      return p;
+    } catch (e) {
+      console.error(`[Serial] 開啟失敗 (${path})，5 秒後重試：`, e.message);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+}
 
-  let roundId = 1;
+async function switchPort(newPath) {
+  if (!newPath) throw new Error('無效的埠路徑');
+  if (newPath === PORT_PATH) return;
+  console.log(`[Serial] 正在切換埠：${PORT_PATH} -> ${newPath}`);
+  PORT_PATH = newPath;
+  // 關閉舊埠
+  if (port) {
+    try { port.removeAllListeners('data'); } catch(_) {}
+    try { await new Promise(res => { try { port.close(()=>res()); } catch(_) { res(); } }); } catch(_) {}
+  }
+  // 開新埠
+  port = await safeOpen(PORT_PATH);
+}
+
+// ====== 主流程（可在切換埠後持續運行） ======
+async function main() {
+  console.log(`RFID 多標籤掃描（Ctrl+C 結束）`);
+  if (process.env.BLACKLIST) console.log(`[BL] 來自環境變數的黑名單：${process.env.BLACKLIST}`);
+  console.log(`[BL] 黑名單共 ${BLACKLIST.size} 筆`);
+  PORT_PATH = await pickPort(PORT_PATH);
+  port = await safeOpen(PORT_PATH);
+
+  running = true;
   const loop = async () => {
+    if (!running) return;
     try {
       const epcs = await inventoryRound(port, WINDOW_MS);
-      if (epcs.size > 0) {
-        const arr = [...epcs].sort();
-        console.log(`[Round ${roundId}] 共 ${arr.length} 張： ${arr.join(', ')}`);
-        // 若啟用 WS，就把本輪 EPC 廣播出去
+      let arr = [...epcs].map(s => s.toUpperCase()).filter(epc => !BLACKLIST.has(epc));
+      if (arr.length > 0) {
+        arr = arr.sort();
+        health.ok++;
+        console.log(`[Round ${roundId}] 共 ${arr.length} 張（已排除黑名單）： ${arr.join(', ')}`);
         wsBroadcast({ epcs: arr, round: roundId, ts: Date.now() });
       } else {
-        console.log(`[Round ${roundId}] 未偵測到標籤`);
+        if (epcs.size > 0) { health.blkOnly++; console.log(`[Round ${roundId}] 全部在黑名單內，已忽略`); }
+        else { health.empty++; console.log(`[Round ${roundId}] 未偵測到標籤`); }
       }
       roundId += 1;
       setTimeout(loop, 200);
@@ -168,19 +267,23 @@ async function main() {
       setTimeout(loop, 500);
     }
   };
-
   loop();
 
-  // 優雅關閉
+  // 健康輸出
+  setInterval(() => {
+    console.log(`[HEALTH] ${new Date().toISOString()} | OK=${health.ok} EMPTY=${health.empty} BLK_ONLY=${health.blkOnly} | WS=${wss? wss.clients.size:0} | PORT=${PORT_PATH}`);
+  }, 60_000);
+
+  // 安全收尾
   process.on('SIGINT', async () => {
-    try { port.close(); } catch (_) {}
+    running = false;
+    try { port && port.close(); } catch(_) {}
     if (server) server.close();
     console.log(os.EOL + '已關閉連線');
     process.exit(0);
   });
+  process.on('uncaughtException', (err) => console.error('[FATAL] Uncaught:', err));
+  process.on('unhandledRejection', (r) => console.error('[FATAL] UnhandledRejection:', r));
 }
 
-main().catch((e) => {
-  console.error('啟動失敗：', e);
-  process.exit(1);
-});
+main().catch((e) => { console.error('啟動失敗：', e); process.exit(1); });

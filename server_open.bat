@@ -8,7 +8,7 @@ REM 切到此批次檔所在資料夾
 cd /d %~dp0
 
 REM ===== 可自訂參數 =====
-set PORT=COM5
+set PORT=auto
 set BAUD=115200
 set WEB_PORT=3000
 set ENABLE_WS=1
